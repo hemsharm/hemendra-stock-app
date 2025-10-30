@@ -14,7 +14,7 @@ st.title("📊 Stock Information Dashboard with RSI & Sector Comparison")
 # -----------------
 # Alpha Vantage Fallback
 # -----------------
-ALPHA_VANTAGE_KEY = "YOUR_ALPHA_VANTAGE_KEY"  # Get free key from: https://www.alphavantage.co/support/#api-key
+ALPHA_VANTAGE_KEY = "60W4OV8MQ1HVW2P8"  # Get free key from: https://www.alphavantage.co/support/#api-key
 
 def get_alpha_vantage(symbol):
     """Fetch historical data from Alpha Vantage if Yahooquery fails"""
