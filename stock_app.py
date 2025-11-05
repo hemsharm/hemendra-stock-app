@@ -12,9 +12,43 @@ st.title("📊 Stock Dashboard with RSI, Earnings & Sector Comparison")
 # -----------------
 # Alpha Vantage Fallback
 # -----------------
-ALPHA_VANTAGE_KEY = "CLARG2WA7A7N6T4G"
+# Load API key from Streamlit secrets
+# try:
+#     ALPHA_VANTAGE_KEY = st.secrets["ALPHA_VANTAGE_KEY"]
+# except KeyError:
+#     ALPHA_VANTAGE_KEY = None
+#     st.warning("⚠️ Alpha Vantage API key not configured. Fallback won't work if Yahoo data fails.")
+
+# def get_alpha_vantage(symbol):
+#     try:
+#         url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+#         data = requests.get(url).json()
+#         if "Time Series (Daily)" not in data:
+#             return None
+#         df = pd.DataFrame(data["Time Series (Daily)"]).T
+#         df.columns = ['open', 'high', 'low', 'close', 'volume']
+#         df = df.astype(float)
+#         df.index = pd.to_datetime(df.index)
+#         df.sort_index(inplace=True)
+#         return df.tail(250)
+#     except Exception:
+#         return None
+
+# -----------------
+# Alpha Vantage API Key (from Streamlit Secrets)
+# -----------------
+try:
+    ALPHA_VANTAGE_KEY = st.secrets["ALPHA_VANTAGE_KEY"]
+except KeyError:
+    ALPHA_VANTAGE_KEY = None
+    st.warning("⚠️ Alpha Vantage API key not configured. Fallback to Alpha Vantage won't work if Yahoo Finance fails.")
+except FileNotFoundError:
+    # For local development without secrets file
+    ALPHA_VANTAGE_KEY = None
 
 def get_alpha_vantage(symbol):
+    if ALPHA_VANTAGE_KEY is None:
+        return None
     try:
         url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
         data = requests.get(url).json()
@@ -28,7 +62,6 @@ def get_alpha_vantage(symbol):
         return df.tail(250)
     except Exception:
         return None
-
 # -----------------
 # yfinance Data
 # -----------------
