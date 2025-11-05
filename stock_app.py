@@ -5,73 +5,99 @@ import numpy as np
 import plotly.graph_objects as go
 import requests
 import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="Stock Dashboard", page_icon="📈", layout="wide")
 st.title("📊 Stock Dashboard with RSI, Earnings & Sector Comparison")
 
 # -----------------
-# Alpha Vantage API Key (from Streamlit Secrets)
+# API Keys from Streamlit Secrets
 # -----------------
 try:
     ALPHA_VANTAGE_KEY = st.secrets["ALPHA_VANTAGE_KEY"]
 except:
     ALPHA_VANTAGE_KEY = None
 
-def get_alpha_vantage(symbol):
-    """Fallback to Alpha Vantage if Yahoo fails"""
-    if ALPHA_VANTAGE_KEY is None:
-        return None
-    try:
-        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
-        data = requests.get(url).json()
-        if "Time Series (Daily)" not in data:
-            return None
-        df = pd.DataFrame(data["Time Series (Daily)"]).T
-        df.columns = ['open', 'high', 'low', 'close', 'volume']
-        df = df.astype(float)
-        df.index = pd.to_datetime(df.index)
-        df.sort_index(inplace=True)
-        return df.tail(250)
-    except Exception:
-        return None
+try:
+    FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
+except:
+    FINNHUB_API_KEY = None
 
 # -----------------
-# yfinance Data with Headers and Retry Logic
+# Data Fetching Functions
 # -----------------
-@st.cache_data
+@st.cache_data(ttl=3600)
 def get_yahoo_data(symbol):
-    """Fetch stock data from Yahoo Finance with retry logic"""
+    """Fetch stock data from Yahoo Finance with aggressive retry logic"""
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    
+    # Create session with retry strategy
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Browser-like headers
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    })
+    
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(symbol, session=session)
         
-        # Set custom User-Agent to avoid blocking
-        ticker.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
-        
-        # Get historical data with retry
+        # Try multiple methods
         hist = None
+        methods = [
+            lambda: ticker.history(period="1y"),
+            lambda: ticker.history(period="1y", interval="1d"),
+            lambda: yf.download(symbol, period="1y", progress=False, session=session)
+        ]
+        
+        for method_idx, method in enumerate(methods):
+            for attempt in range(5):
+                try:
+                    hist = method()
+                    if hist is not None and not hist.empty:
+                        break
+                except Exception as e:
+                    if attempt < 4:
+                        wait_time = (2 ** attempt)
+                        time.sleep(wait_time)
+                    continue
+            
+            if hist is not None and not hist.empty:
+                break
+        
+        if hist is None or hist.empty:
+            return None, None
+        
+        # Handle MultiIndex
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        
+        hist.columns = hist.columns.str.lower()
+        
+        # Get info with retry
+        info = {}
         for attempt in range(3):
             try:
-                hist = ticker.history(period="1y")
-                if not hist.empty:
+                info = ticker.info
+                if info and len(info) > 0:
                     break
             except:
                 if attempt < 2:
                     time.sleep(2)
-                continue
-        
-        if hist is None or hist.empty:
-            return None, None
-            
-        hist.columns = hist.columns.str.lower()
-        
-        # Get company info
-        info = {}
-        try:
-            info = ticker.info
-        except:
-            info = {}
         
         # Get quarterly financials with retry
         quarterly_income = pd.DataFrame()
@@ -83,12 +109,11 @@ def get_yahoo_data(symbol):
             except:
                 if attempt < 2:
                     time.sleep(2)
-                continue
         
         if quarterly_income is None:
             quarterly_income = pd.DataFrame()
         
-        # Get analyst recommendations
+        # Get recommendations
         recommendations = pd.DataFrame()
         try:
             recommendations = ticker.recommendations
@@ -98,12 +123,84 @@ def get_yahoo_data(symbol):
             pass
         
         return hist, {
-            'info': info,
+            'info': info if info else {},
             'quarterly_income': quarterly_income,
             'recommendations': recommendations
         }
+        
     except Exception as e:
         return None, None
+
+def get_finnhub_data(symbol):
+    """Fetch data from Finnhub as fallback"""
+    if FINNHUB_API_KEY is None:
+        return None, None
+    
+    try:
+        from datetime import datetime, timedelta
+        
+        # Get historical data
+        end_date = int(datetime.now().timestamp())
+        start_date = int((datetime.now() - timedelta(days=365)).timestamp())
+        
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=D&from={start_date}&to={end_date}&token={FINNHUB_API_KEY}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if data.get('s') == 'ok':
+            df = pd.DataFrame({
+                'open': data['o'],
+                'high': data['h'],
+                'low': data['l'],
+                'close': data['c'],
+                'volume': data['v']
+            })
+            df.index = pd.to_datetime(data['t'], unit='s')
+            
+            # Get company profile
+            company_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={FINNHUB_API_KEY}"
+            company_data = requests.get(company_url, timeout=10).json()
+            
+            # Get earnings (basic)
+            earnings_url = f"https://finnhub.io/api/v1/stock/earnings?symbol={symbol}&token={FINNHUB_API_KEY}"
+            earnings_data = requests.get(earnings_url, timeout=10).json()
+            
+            # Get recommendations
+            rec_url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={symbol}&token={FINNHUB_API_KEY}"
+            rec_data = requests.get(rec_url, timeout=10).json()
+            
+            return df, {
+                'info': {
+                    'longName': company_data.get('name', symbol),
+                    'sector': company_data.get('finnhubIndustry', 'N/A'),
+                    'industry': company_data.get('finnhubIndustry', 'N/A'),
+                    'trailingEps': earnings_data[0].get('actual') if earnings_data else None
+                },
+                'quarterly_income': pd.DataFrame(),
+                'recommendations': pd.DataFrame(),
+                'source': 'finnhub'
+            }
+        return None, None
+    except Exception as e:
+        return None, None
+
+def get_alpha_vantage(symbol):
+    """Fallback to Alpha Vantage"""
+    if ALPHA_VANTAGE_KEY is None:
+        return None
+    try:
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+        data = requests.get(url, timeout=10).json()
+        if "Time Series (Daily)" not in data:
+            return None
+        df = pd.DataFrame(data["Time Series (Daily)"]).T
+        df.columns = ['open', 'high', 'low', 'close', 'volume']
+        df = df.astype(float)
+        df.index = pd.to_datetime(df.index)
+        df.sort_index(inplace=True)
+        return df.tail(250)
+    except:
+        return None
 
 # -----------------
 # Helper Functions
@@ -113,7 +210,7 @@ def calculate_ma(hist_df, days):
     return hist_df['close'].rolling(window=days).mean().iloc[-1]
 
 def get_rsi(series, period=14):
-    """Calculate RSI indicator"""
+    """Calculate RSI"""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -153,11 +250,11 @@ def get_analyst_rating(recommendations):
             'overall': overall, 'buy': buy_count, 'hold': hold_count, 'sell': sell_count,
             'buy_pct': buy_pct, 'hold_pct': hold_pct, 'sell_pct': sell_pct
         }
-    except Exception:
+    except:
         return None
 
 def create_price_chart(hist_data, low_200):
-    """Create candlestick chart with moving averages"""
+    """Create candlestick chart"""
     hist_data = hist_data.copy()
     hist_data['MA20'] = hist_data['close'].rolling(window=20).mean()
     hist_data['MA50'] = hist_data['close'].rolling(window=50).mean()
@@ -176,7 +273,7 @@ def create_price_chart(hist_data, low_200):
     return fig
 
 def create_rsi_chart(rsi_series):
-    """Create RSI indicator chart"""
+    """Create RSI chart"""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=rsi_series.index, y=rsi_series, mode='lines', line=dict(color='purple'), name="RSI"))
     fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought")
@@ -185,7 +282,7 @@ def create_rsi_chart(rsi_series):
     return fig
 
 # -----------------
-# Session State Initialization
+# Session State
 # -----------------
 if 'hist_data' not in st.session_state:
     st.session_state.hist_data = None
@@ -193,6 +290,8 @@ if 'data' not in st.session_state:
     st.session_state.data = None
 if 'stock_symbol' not in st.session_state:
     st.session_state.stock_symbol = "AAPL"
+if 'data_source' not in st.session_state:
+    st.session_state.data_source = None
 
 # -----------------
 # UI Input
@@ -202,36 +301,55 @@ with col1:
     stock_symbol = st.text_input("Enter Stock Symbol (e.g., AAPL, MSFT, TSLA)", value=st.session_state.stock_symbol)
 with col2:
     st.write("")
-    fetch_btn = st.button("Fetch Data")
+    fetch_btn = st.button("Fetch Data", type="primary")
 
 # -----------------
-# Fetch Data
+# Fetch Data with Multiple Fallbacks
 # -----------------
 if fetch_btn and stock_symbol.strip():
     st.session_state.stock_symbol = stock_symbol.upper()
-    with st.spinner(f"Fetching data for {stock_symbol.upper()}..."):
+    
+    with st.spinner(f"🔄 Fetching data for {stock_symbol.upper()}..."):
+        # Try Yahoo Finance first
         hist_data, data = get_yahoo_data(stock_symbol)
+        source = "Yahoo Finance"
 
+        # Try Finnhub if Yahoo fails
+        if (hist_data is None or hist_data.empty) and FINNHUB_API_KEY:
+            st.warning("⚠️ Yahoo Finance unavailable — trying Finnhub...")
+            hist_data, data = get_finnhub_data(stock_symbol.upper())
+            source = "Finnhub"
+
+        # Try Alpha Vantage as last resort
         if hist_data is None or hist_data.empty:
-            st.warning("⚠️ Yahoo Finance data not available — trying Alpha Vantage fallback...")
+            st.warning("⚠️ Trying Alpha Vantage fallback...")
             hist_data = get_alpha_vantage(stock_symbol.upper())
-            data = {'info': {}, 'quarterly_income': pd.DataFrame(), 'recommendations': pd.DataFrame()}
+            if hist_data is not None:
+                data = {'info': {}, 'quarterly_income': pd.DataFrame(), 'recommendations': pd.DataFrame()}
+                source = "Alpha Vantage"
 
         if hist_data is None or hist_data.empty:
-            st.error(f"❌ Could not fetch data for {stock_symbol.upper()}. Please check the symbol or try again later.")
+            st.error(f"❌ Could not fetch data for {stock_symbol.upper()} from any source. Please check the symbol or try again later.")
+            st.info("💡 Tip: Make sure you're using the correct ticker symbol (e.g., AAPL for Apple, MSFT for Microsoft)")
             st.session_state.hist_data = None
             st.session_state.data = None
+            st.session_state.data_source = None
         else:
             st.session_state.hist_data = hist_data
             st.session_state.data = data
-            st.success(f"✅ Successfully loaded data for {stock_symbol.upper()}")
+            st.session_state.data_source = source
+            st.success(f"✅ Successfully loaded data for {stock_symbol.upper()} from {source}")
 
 # -----------------
-# Display Data (if available)
+# Display Data
 # -----------------
 if st.session_state.hist_data is not None and st.session_state.data is not None:
     hist_data = st.session_state.hist_data
     data = st.session_state.data
+    
+    # Display data source badge
+    if st.session_state.data_source:
+        st.caption(f"📡 Data Source: {st.session_state.data_source}")
     
     try:
         company_name = data['info'].get('longName', st.session_state.stock_symbol)
@@ -241,14 +359,13 @@ if st.session_state.hist_data is not None and st.session_state.data is not None:
     current_price = hist_data['close'].iloc[-1]
     st.subheader(f"{company_name} ({st.session_state.stock_symbol}) — ${current_price:.2f}")
 
-    # Calculate metrics
+    # Metrics
     low_200 = hist_data['low'].tail(200).min()
     ma50 = calculate_ma(hist_data, 50)
     ma20 = calculate_ma(hist_data, 20)
     rsi_series = get_rsi(hist_data['close'])
-    analyst_data = get_analyst_rating(data['recommendations'])
+    analyst_data = get_analyst_rating(data.get('recommendations', pd.DataFrame()))
 
-    # Display metrics
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("200-Day Low", f"${low_200:.2f}", f"{((current_price - low_200)/low_200)*100:.2f}%")
     c2.metric("50-Day MA", f"${ma50:.2f}", f"{((current_price - ma50)/ma50)*100:.2f}%")
@@ -271,7 +388,7 @@ if st.session_state.hist_data is not None and st.session_state.data is not None:
     # Quarterly Earnings
     st.write("---")
     try:
-        quarterly_df = data['quarterly_income']
+        quarterly_df = data.get('quarterly_income', pd.DataFrame())
         
         if isinstance(quarterly_df, pd.DataFrame) and not quarterly_df.empty:
             last4_cols = quarterly_df.columns[:4]
@@ -301,7 +418,7 @@ if st.session_state.hist_data is not None and st.session_state.data is not None:
             else:
                 st.info("ℹ️ Quarterly earnings data not available in expected format.")
         else:
-            st.info("ℹ️ No quarterly earnings data available for this symbol.")
+            st.info("ℹ️ Quarterly earnings data not available (only available from Yahoo Finance source)")
     except Exception as e:
         st.info("ℹ️ Quarterly earnings data not available.")
 
@@ -312,7 +429,8 @@ if st.session_state.hist_data is not None and st.session_state.data is not None:
 
     # Analyst Breakdown
     if analyst_data:
-        st.write("### 📊 Analyst Breakdown")
+        st.write("---")
+        st.subheader("📊 Analyst Breakdown")
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("🟢 Buy", f"{analyst_data['buy']} ({analyst_data['buy_pct']:.1f}%)")
@@ -323,7 +441,7 @@ if st.session_state.hist_data is not None and st.session_state.data is not None:
 
     # Sector & Industry
     st.write("---")
-    st.subheader("📈 Sector & Industry Information")
+    st.subheader("📈 Sector & Industry")
     try:
         sector = data['info'].get('sector', 'N/A')
         industry = data['info'].get('industry', 'N/A')
@@ -337,4 +455,4 @@ if st.session_state.hist_data is not None and st.session_state.data is not None:
 
 # Footer
 st.write("---")
-st.caption("💡 Data provided by Yahoo Finance. For informational purposes only. Not financial advice.")
+st.caption("💡 Data sources: Yahoo Finance, Finnhub, Alpha Vantage | For informational purposes only | Not financial advice")
